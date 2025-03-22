@@ -1,0 +1,89 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+MAX30105 particleSensor;
+const int trigPin = 5;
+const int echoPin = 18;
+const char* ssid = "motorola edge 20 fusion_5396";
+const char* password = "Mint Sause Fries";
+const char* serverIP = "192.168.120.229"; 
+const int serverPort = 5000;
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi!");
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 sensor not found.");
+    while (1);
+  }
+  particleSensor.setup();
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  Serial.println("Sensors initialized.");
+}
+
+float readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH);
+  float distance = duration * 0.034 / 2; // in cm
+  return distance;
+}
+
+float calculateBPM() {
+  if (particleSensor.check() == false) {
+    return -1; // No finger detected
+  }
+  float bpm = particleSensor.getIR();
+  return bpm > 50000 ? bpm / 1000 : -1; // Rough conversion
+}
+
+void sendDataToRaspberryPi(float distance, float bpm, float spo2) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "http://" + String(serverIP) + ":" + String(serverPort) + "/data";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+
+    String jsonPayload = "{\"distance\":" + String(distance) + 
+                         ",\"bpm\":" + String(bpm) + 
+                         ",\"spo2\":" + String(spo2) + "}";
+
+    int httpResponseCode = http.POST(jsonPayload);
+    Serial.println("Data sent. Response: " + String(httpResponseCode));
+    http.end();
+  } else {
+    Serial.println("WiFi not connected!");
+  }
+}
+
+void loop() {
+  float distance = readDistance();
+  float bpm = calculateBPM();
+  float spo2 = random(95, 99); 
+
+  if (bpm == -1) {
+    Serial.println("No finger detected.");
+  } else {
+    Serial.println("BPM: " + String(bpm) + " | SpO2: " + String(spo2) + "%");
+  }
+
+  if (distance <= 150) {
+    Serial.println("Object detected at " + String(distance) + " cm");
+  }
+
+  sendDataToRaspberryPi(distance, bpm, spo2);
+  delay(5000); // Send data every 5 seconds
+}
