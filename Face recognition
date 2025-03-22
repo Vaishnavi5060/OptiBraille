@@ -1,0 +1,156 @@
+import serial
+import cv2
+import numpy as np
+import face_recognition
+import time
+import pickle
+import threading
+import logging
+from queue import Queue
+from dataclasses import dataclass
+from typing import Optional
+from contextlib import contextmanager
+import pygame
+from gtts import gTTS
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Config:
+    VIDEO_STREAM_URL: str = "http://192.168.120.113/html/cam_pic_new.php?time=now"
+    SCALING_FACTOR: int = 4
+    MATCH_THRESHOLD: float = 0.70
+    FRAME_PROCESS_INTERVAL: int = 10
+    SPEAK_INTERVAL: int = 3
+    RECONNECT_DELAY: int = 5
+    MAX_RETRIES: int = 3
+    QUEUE_SIZE: int = 10
+
+class FaceDetectionSystem:
+    def __init__(self):
+        self.config = Config()
+        self.frame_queue = Queue(maxsize=self.config.QUEUE_SIZE)
+        self.stop_event = threading.Event()
+        self.recognized_name: Optional[str] = None
+        self.last_speak_time: float = 0
+        self.frame_count: int = 0
+        self.setup_tts()
+        self.load_face_encodings()
+
+    def setup_tts(self):
+        try:
+            pygame.mixer.init()
+            self.tts_enabled = True
+        except Exception as e:
+            self.tts_enabled = False
+
+    def load_face_encodings(self):
+        try:
+            with open("encodings.pickle", "rb") as f:
+                data = pickle.loads(f.read())
+            self.known_faces = data["encodings"]
+            self.known_names = data["names"]
+            self.face_recognition_ready = True
+        except Exception as e:
+            self.face_recognition_ready = False
+            self.known_faces = []
+            self.known_names = []
+
+    @contextmanager
+    def video_capture(self):
+        cap = cv2.VideoCapture(self.config.VIDEO_STREAM_URL)
+        try:
+            if not cap.isOpened():
+                raise RuntimeError("Could not access video stream.")
+            yield cap
+        finally:
+            cap.release()
+
+    def speak(self, text: str):
+        if self.tts_enabled:
+            try:
+                tts = gTTS(text=text, lang="mr")
+                tts.save("speech.mp3")
+                pygame.mixer.music.load("speech.mp3")
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+            except Exception as e:
+                pass
+
+    def process_face(self, frame):
+        if not self.face_recognition_ready:
+            return
+        try:
+            small_frame = cv2.resize(frame, (0, 0), fx=1/self.config.SCALING_FACTOR, fy=1/self.config.SCALING_FACTOR)
+            rgb_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(rgb_frame)
+            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+            current_time = time.time()
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                matches = face_recognition.compare_faces(self.known_faces, face_encoding, tolerance=self.config.MATCH_THRESHOLD)
+                name = "अपरिचित"
+                if any(matches):
+                    distances = face_recognition.face_distance(self.known_faces, face_encoding)
+                    best_match_idx = np.argmin(distances)
+                    if matches[best_match_idx]:
+                        name = self.known_names[best_match_idx]
+                if self.recognized_name != name and (current_time - self.last_speak_time > self.config.SPEAK_INTERVAL):
+                    self.recognized_name = name
+                    threading.Thread(target=self.speak, args=(f"{name} ओळखले गेले आहे.",)).start()
+                    self.last_speak_time = current_time
+                top, right, bottom, left = [i * self.config.SCALING_FACTOR for i in [top, right, bottom, left]]
+                color = (0, 255, 0) if name != "अपरिचित" else (0, 0, 255)
+                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+        except Exception as e:
+            pass
+
+    def capture_frames(self):
+        retries = 0
+        while not self.stop_event.is_set():
+            try:
+                with self.video_capture() as cap:
+                    retries = 0
+                    while not self.stop_event.is_set():
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        if not self.frame_queue.full():
+                            self.frame_queue.put(frame)
+            except Exception as e:
+                retries += 1
+                if retries >= self.config.MAX_RETRIES:
+                    break
+                time.sleep(self.config.RECONNECT_DELAY)
+
+    def process_frames(self):
+        while not self.stop_event.is_set():
+            try:
+                frame = self.frame_queue.get(timeout=1)
+                if self.frame_count % self.config.FRAME_PROCESS_INTERVAL == 0:
+                    self.process_face(frame)
+                cv2.imshow("Live Stream", frame)
+                self.frame_count += 1
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    self.stop_event.set()
+                    break
+            except Exception as e:
+                pass
+
+    def run(self):
+        capture_thread = threading.Thread(target=self.capture_frames)
+        capture_thread.start()
+        process_thread = threading.Thread(target=self.process_frames)
+        process_thread.start()
+        try:
+            capture_thread.join()
+            process_thread.join()
+        except KeyboardInterrupt:
+            self.stop_event.set()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    system = FaceDetectionSystem()
+    system.run()
